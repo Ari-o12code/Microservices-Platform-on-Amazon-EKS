@@ -1,4 +1,4 @@
-# Altschool Cloud Engineering Capstone Project: Deployment of Socks Shop, a microservices-based application, on Kubernetes using Infrastructure as Code (IaaC).
+# Microservices Platform on Amazon EKS
 
 ## Project Overview:
 
