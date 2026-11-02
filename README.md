@@ -1,196 +1,150 @@
 # Microservices Platform on Amazon EKS
 
-## Project Overview:
+This repository runs the Socks Shop microservices demo on Amazon EKS. Terraform builds the network and the cluster. Kubernetes manifests and Helm charts run the shop and its monitoring, and two GitHub Actions workflows run both steps.
 
-We aim to deploy a microservices-based application, specifically the Socks Shop, using a modern approach that emphasizes automation and efficiency. The goal is to use Infrastructure as Code (IaaC) for rapid and reliable deployment on Kubernetes.
-The main task is to set up the Socks Shop application, a demonstration of a microservices architecture, available on GitHub. Using tools and technologies that automate the setup process, ensuring that the application can be deployed quickly and consistently.
+## What It Builds
 
-## Architecture:
-```
+- A VPC in us-east-1 across three Availability Zones, with three public and three private subnets and a single NAT gateway.
+- An EKS 1.30 cluster with two managed node groups of t3.small instances, running in the private subnets.
+- An IAM role for the EBS CSI driver, assumed through the cluster's OIDC provider (IRSA).
+- Terraform state in an encrypted S3 bucket.
+- The Socks Shop services in the `sock-shop` namespace, behind ingress-nginx.
+- Prometheus and Grafana from the kube-prometheus-stack chart.
+- Route 53 records for the shop, Grafana and Prometheus.
+
+## Architecture
+
+```mermaid
 graph LR
-A[AWS] --> B(Route53)
-A --> C(EKS Cluster)
-    C --> D{Node Group (t3.small)}
-    C --> D{Node Group (t3.small)}
-C --> E(Terraform)
-E --> F(Kubernetes)
-F --> G(Socks Shop)
-F --> H{Prometheus}
-F --> I{Grafana}
-B --> J(Public Internet)
-J --> F
-K(CI/CD Pipeline) --> E
+  User((Internet)) --> R53[Route 53]
+  R53 --> LB[ingress-nginx load balancer]
+  subgraph EKS [EKS cluster in private subnets]
+    Shop[Socks Shop]
+    Grafana
+    Prometheus
+  end
+  LB --> Shop
+  LB --> Grafana
+  LB --> Prometheus
+  GHA[GitHub Actions] --> TF[Terraform]
+  GHA --> Helm[Helm and kubectl]
+  TF --> EKS
+  Helm --> EKS
 ```
-### Explanation:
 
-1. This architecture utilizes AWS services: Route53 for domain management, EKS for the Kubernetes cluster, and IAM for authentication (not explicitly shown).
-2. The EKS cluster uses two node groups of t3.small instance types.
-3. Terraform manages the infrastructure resources.
-4. The Kubernetes cluster hosts the Socks Shop application, Prometheus for monitoring, and Grafana for visualization.
-5. The public internet can access the application through a domain hosted on Route53, which routes traffic to the ingress on the Kubernetes cluster.
-6. A CI/CD pipeline automates deployments using Terraform and Helm charts.
+## Repository Layout
 
-## Project prerequisites:
+| Path | What it holds |
+|---|---|
+| `terraform/vpc.tf` | The VPC, from the `terraform-aws-modules/vpc` module |
+| `terraform/eks-cluster.tf` | The cluster, both node groups and the EBS CSI role |
+| `terraform/s3-backend.tf` | Remote state in S3 |
+| `terraform/terraform.tfvars` | The CIDR ranges |
+| `kubernetes/deployment.yaml` | The Socks Shop namespace, deployments and services |
+| `kubernetes/ingress.yaml` | Host rules for the shop, Grafana and Prometheus |
+| `.github/workflows/terraform.yml` | Builds the infrastructure |
+| `.github/workflows/kubernetes.yml` | Installs the charts and applies the manifests |
 
--The following has to be installed/configured;
-1. Terraform
-2. AWS Account
-3. AWS cli
-4. Kubernetes
-5. Kubectl
-6. Helm
-7. Prometheus & grafana installed with helm 
-8. ELK Stack
-9. Let's Encrypt
+## Deploy It
 
-## Deployment Steps:
+You need an AWS account, the AWS CLI, Terraform, kubectl and Helm.
 
-1. Configure AWS CLI: Set up AWS credentials and configure the AWS CLI for interacting with AWS services.
+Warning: EKS, the NAT gateway and the load balancer bill by the hour. Run `terraform destroy` when you finish.
 
-2. Terraform Configuration:
-    - Create a directory "terraform" to keep all teraform configuration files;
-    You can get configuration commands for each file from the official terraform documentation.
+The state bucket has to exist before `terraform init`. Bucket names are global, so change the name in `terraform/s3-backend.tf` first, then create it:
 
-    ```bash
-    mkdir terraform
-    cd terraform
-    ```
-    - Define VPC resources (network, subnets, security groups) in vpc.tf file.
+```bash
+aws s3 mb s3://sockshop-terraform-state-bucket --region us-east-2
+```
 
-    ```bash
-    touch vpc.tf
-    ```
-    - Define the EKS cluster configuration (node groups, IAM roles) in eks-cluster.tf.
+Build the network and the cluster:
 
-    ```bash
-    touch eks-cluster.tf
-    ```
+```bash
+cd terraform
+terraform init
+terraform plan
+terraform apply
+```
 
-    - Use variables in terraform.tfvars to customize resource settings.
+![terraform init output](images/terrafrom-init-img.jpg)
+![terraform plan output](images/terrafrom-plan-img.jpg)
+![terraform apply output](images/terraform-apply-img.jpg)
 
-3. Run Terraform: 
+The cluster, the VPC and the node instances in the console:
 
-    -Use terraform init and terraform apply to provision the infrastructure.
+![EKS cluster in the console](images/eks-cluster.jpg)
+![VPC in the console](images/vpc.jpg)
+![Node group instances in EC2](images/ec2-instances.jpg)
 
-    ```bash
-    terraform init
-    ```
-    ![terraform init](images/terrafrom-init-img.jpg)
-    
-     ```bash
-    terraform plan
-    ```
-    ![terraform init](images/terrafrom-plan-img.jpg)
+Point kubectl at the cluster:
 
-     ```bash
-    terraform apply --auto-approve
-    #the flag --auto-approve can be added to avoid the prompt for confirmation.
-    ```
-    ![terraform init](images/terraform-apply-img.jpg)
+```bash
+aws eks update-kubeconfig --name alameen-eks-cluster --region us-east-1
+```
 
-    Below are images of my eks cluster, vpc and ec2 instances provisioned by terraform:
+Deploy the shop:
 
-    ![terraform init](images/eks-cluster.jpg)
-    ![terraform init](images/vpc.jpg)
-    ![terraform init](images/ec2-instances.jpg)
+```bash
+kubectl apply -f kubernetes/deployment.yaml
+```
 
-4. Kubernetes Configuration:
+![kubectl apply output](images/kubectl-apply-img.jpg)
 
-    -Create a folder to keep all kubernetes configuration files.
+Install ingress-nginx, which creates the load balancer:
 
-     ```bash
-    mkdir kubernetes
-    cd kubernetes
-    ```
-    -keep both deployment.yaml and ingress.yaml files in the directory.
+```bash
+helm repo add ingress https://kubernetes.github.io/ingress-nginx
+helm upgrade --install ingress ingress/ingress-nginx
+```
 
-    -configure the kubectl to connect to the EKS cluster, the specified region and the cluster name.
+Install Prometheus and Grafana in the shop's namespace. The ingress rules expect this release name:
 
-      ```bash
-    aws eks update-kubeconfig --name=alameen-eks-cluster --region=us-east-1
-    ```
-    -After the infrastructure has been provisioned, run the command to deploy with kubernetes
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm install prometheus-community prometheus-community/kube-prometheus-stack --namespace sock-shop
+```
 
-     ```bash
-    kubectl apply -f deployment.yaml
-    ```
-    ![terraform init](images/kubectl-apply-img.jpg)
+![helm install output](images/helm-install-prometheus.jpg)
 
-5. Displaying front-end of Application:
+Point the three hostnames in Route 53 at the load balancer. The hosts are in `kubernetes/ingress.yaml`, so change them to your own domain, then apply the rules:
 
-    -ingress-nginx chart can be installed with helm, this helps us create a loadbalancer 
+```bash
+kubectl apply -f kubernetes/ingress.yaml
+```
 
-    -After that has been created, we would specify a domain name hosted in aws route53 within our ingress file configurations where the front-end can be displayed
+![Route 53 records](images/route53-records.jpg)
 
-    -we then run kubectl command below to apply changes;
+Check the services:
 
-    ```bash
-    kubectl apply -f ingress.yaml
-    ```
-    -Below are images of our front-end displayed:
-    
-    ![terraform init](images/sock-shop-frontend.jpg)
-    ![terraform init](images/sock-shop-frontend2.jpg)
+```bash
+kubectl get svc -n sock-shop
+```
 
-6. CI/CD Pipeline:
+![kubectl get svc output](images/kubectl-services.jpg)
 
-    CI/CD Pipeline will be set up using GitHub Actions to automate infrastructure provisioning and application deployments triggered by code changes.
-    ![terraform init](images/terraform-build-ghactions.jpg)
+## The Running Platform
 
-7. Monitoring:
+The shop:
 
-    - Monitoring tools (Prometheus & Grafana) will be installed using helm after first adding the prometheus repo to our project from artifacthub;
+![Socks Shop home page](images/sock-shop-frontend.jpg)
+![Socks Shop catalogue](images/sock-shop-frontend2.jpg)
 
-    - Run the command to install helm:
+Prometheus and Grafana:
 
-    ```bash
-    helm install prometheus-community --namespace sock-shop prometheus-community/kube-prometheus-stack
-    ```
+![Prometheus](images/prometheus.jpg)
+![Grafana](images/grafana.jpg)
 
-    ![terraform init](images/helm-install-prometheus.jpg)
+## The Pipelines
 
-    -Both prometheus and grafana can be added to the configurations of the ingress.yaml file and hosted on aws route53.
+`terraform.yml` runs on a push to the `terraform` branch, or by hand. It creates the state bucket, installs kubectl, Helm and Terraform, applies the Terraform, updates the kubeconfig and creates the `sock-shop` namespace.
 
-    * **They can then be accessed as shown below;**
+`kubernetes.yml` runs on a push or pull request to `master`, or by hand. It installs cert-manager, installs ingress-nginx and kube-prometheus-stack with `helm upgrade --install`, and applies everything in `kubernetes/`.
 
-    -Prometheus:
+![Terraform workflow run](images/terraform-build-ghactions.jpg)
+![Terraform pipeline jobs](images/terraform-pipeline-ghaction.jpg)
 
-    ![terraform init](images/prometheus.jpg)
+## What I Would Change Now
 
-    -Grafana:
-
-    ![terraform init](images/grafana.jpg)
-
-    You can use the command below to get running services on kubernetes:
-    ```bash
-    kubectl get svc -n sock-shop
-    ```
-    ![terraform init](images/kubectl-services.jpg)
-
-8. Security:
-
-The application will be secured with HTTPS using a Let's Encrypt certificate. Let's Encrypt is a free, automated, and open certificate authority that provides free SSL/TLS certificates for websites. The certificate will be used to secure the communication between the client and the Socks-Shop application, ensuring that the data is encrypted and secure.
-
-## Conclusion
-
-This README document has provided a comprehensive overview of the Socks Shop microservices application deployment on Kubernetes using Infrastructure as Code (IaC). We have covered the key components, architecture, and steps involved in setting up the project.
-
-**Key Takeaways:**
-
-* **Infrastructure as Code:** Terraform was used to automate the provisioning of infrastructure resources on AWS, including the EKS cluster, VPC, and other necessary components.
-* **Microservices Architecture:** The Socks Shop application is a collection of microservices deployed on Kubernetes, enabling scalability and flexibility.
-* **Monitoring and Alerting:** Prometheus and Grafana were integrated to provide robust monitoring and visualization of application metrics.
-* **CI/CD Pipeline:** The use of a CI/CD pipeline (GitHub Actions) automated the deployment process, ensuring consistency and efficiency.
-* **Security:** Best practices for security were considered, including the use of HTTPS with Let's Encrypt and potential network perimeter security measures.
-
-**Future Enhancements:**
-
-* **Scaling:** Implement automated scaling mechanisms to adjust application resources based on load.
-* **Service Mesh:** Explore the use of a service mesh like Istio for advanced traffic management and observability.
-* **Additional Monitoring:** Consider adding more metrics and dashboards to gain deeper insights into application performance.
-* **Security Best Practices:** Continuously review and update security measures to address evolving threats.
-
-By following the steps outlined in this README and considering the future enhancements, you can further improve the deployment and management of the Socks Shop application on Kubernetes.
-
-
-
+- Replace the stored access keys in both workflows with an IAM role that GitHub Actions assumes through OIDC, so no long-lived key sits in the repository secrets.
+- Lock the state. The S3 backend has no lock, so two runs could write the state at once. The backend's `use_lockfile` setting fixes that.
+- Finish HTTPS. The pipeline installs cert-manager, but there is no issuer or certificate yet, so the ingress serves plain HTTP.
